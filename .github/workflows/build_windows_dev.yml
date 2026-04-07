@@ -1,0 +1,48 @@
+name: Build Windows (dev)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  build_windows_x86_64:
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Set release channel to dev
+        run: echo "dev" | Out-File -FilePath crates/zed/RELEASE_CHANNEL -Encoding ascii -NoNewline
+        shell: pwsh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build zed.exe
+        run: cargo build --release --package zed --target x86_64-pc-windows-msvc
+        shell: pwsh
+
+      - name: Upload zed.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/zed.exe
+          if-no-files-found: error

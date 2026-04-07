@@ -114,6 +114,61 @@ pub fn into_open_ai(
         }
     }
 
+    // Some OpenAI-compatible backends (e.g. AWS Bedrock via a proxy) require
+    // toolConfig/tools to be present in every request where the message history
+    // contains toolUse or toolResult blocks, even when no tools are available for
+    // the current turn. Detect that situation and inject a placeholder tool so the
+    // backend's validation passes, then force tool_choice to None so the model
+    // won't actually invoke it.
+    let messages_contain_tool_content = messages.iter().any(|m| match m {
+        crate::RequestMessage::Assistant { tool_calls, .. } => !tool_calls.is_empty(),
+        crate::RequestMessage::Tool { .. } => true,
+        _ => false,
+    });
+
+    let injected_placeholder = messages_contain_tool_content && request.tools.is_empty();
+    let tools: Vec<crate::ToolDefinition> = if !request.tools.is_empty() {
+        request
+            .tools
+            .into_iter()
+            .map(|tool| crate::ToolDefinition::Function {
+                function: FunctionDefinition {
+                    name: tool.name,
+                    description: Some(tool.description),
+                    parameters: Some(tool.input_schema),
+                },
+            })
+            .collect()
+    } else if messages_contain_tool_content {
+        // Inject a placeholder so the backend accepts the request.
+        vec![crate::ToolDefinition::Function {
+            function: FunctionDefinition {
+                name: "_placeholder".into(),
+                description: Some(
+                    "Placeholder tool to satisfy API requirements when conversation \
+                     history contains tool usage"
+                        .into(),
+                ),
+                parameters: Some(
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+            },
+        }]
+    } else {
+        vec![]
+    };
+
+    let tool_choice = if injected_placeholder {
+        // Force None so the placeholder is never called.
+        Some(crate::ToolChoice::None)
+    } else {
+        request.tool_choice.map(|choice| match choice {
+            LanguageModelToolChoice::Auto => crate::ToolChoice::Auto,
+            LanguageModelToolChoice::Any => crate::ToolChoice::Required,
+            LanguageModelToolChoice::None => crate::ToolChoice::None,
+        })
+    };
+
     crate::Request {
         model: model_id.into(),
         messages,
@@ -126,7 +181,7 @@ pub fn into_open_ai(
         stop: request.stop,
         temperature: request.temperature.or(Some(1.0)),
         max_completion_tokens: max_output_tokens,
-        parallel_tool_calls: if supports_parallel_tool_calls && !request.tools.is_empty() {
+        parallel_tool_calls: if supports_parallel_tool_calls && !tools.is_empty() {
             Some(supports_parallel_tool_calls)
         } else {
             None
@@ -136,22 +191,8 @@ pub fn into_open_ai(
         } else {
             None
         },
-        tools: request
-            .tools
-            .into_iter()
-            .map(|tool| crate::ToolDefinition::Function {
-                function: FunctionDefinition {
-                    name: tool.name,
-                    description: Some(tool.description),
-                    parameters: Some(tool.input_schema),
-                },
-            })
-            .collect(),
-        tool_choice: request.tool_choice.map(|choice| match choice {
-            LanguageModelToolChoice::Auto => crate::ToolChoice::Auto,
-            LanguageModelToolChoice::Any => crate::ToolChoice::Required,
-            LanguageModelToolChoice::None => crate::ToolChoice::None,
-        }),
+        tools,
+        tool_choice,
         reasoning_effort,
     }
 }
@@ -165,6 +206,16 @@ pub fn into_open_ai_response(
     reasoning_effort: Option<ReasoningEffort>,
 ) -> ResponseRequest {
     let stream = !model_id.starts_with("o1-");
+
+    // Scan before destructuring so we can detect tool history while tools is still accessible.
+    let messages_contain_tool_content = request.messages.iter().any(|m| {
+        m.content.iter().any(|c| {
+            matches!(
+                c,
+                MessageContent::ToolUse(_) | MessageContent::ToolResult(_)
+            )
+        })
+    });
 
     let LanguageModelRequest {
         thread_id,
@@ -185,15 +236,45 @@ pub fn into_open_ai_response(
         append_message_to_response_items(message, index, &mut input_items);
     }
 
-    let tools: Vec<_> = tools
-        .into_iter()
-        .map(|tool| crate::responses::ToolDefinition::Function {
-            name: tool.name,
-            description: Some(tool.description),
-            parameters: Some(tool.input_schema),
+    // Same placeholder logic as into_open_ai: some OpenAI-compatible backends
+    // (e.g. AWS Bedrock via a proxy) require tools to be present whenever the
+    // message history contains tool use/result blocks.
+    let injected_placeholder = messages_contain_tool_content && tools.is_empty();
+    let tools: Vec<crate::responses::ToolDefinition> = if !tools.is_empty() {
+        tools
+            .into_iter()
+            .map(|tool| crate::responses::ToolDefinition::Function {
+                name: tool.name,
+                description: Some(tool.description),
+                parameters: Some(tool.input_schema),
+                strict: None,
+            })
+            .collect()
+    } else if messages_contain_tool_content {
+        vec![crate::responses::ToolDefinition::Function {
+            name: "_placeholder".into(),
+            description: Some(
+                "Placeholder tool to satisfy API requirements when conversation \
+                 history contains tool usage"
+                    .into(),
+            ),
+            parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
             strict: None,
+        }]
+    } else {
+        vec![]
+    };
+
+    let tool_choice = if injected_placeholder {
+        // Force None so the placeholder is never called.
+        Some(crate::ToolChoice::None)
+    } else {
+        tool_choice.map(|choice| match choice {
+            LanguageModelToolChoice::Auto => crate::ToolChoice::Auto,
+            LanguageModelToolChoice::Any => crate::ToolChoice::Required,
+            LanguageModelToolChoice::None => crate::ToolChoice::None,
         })
-        .collect();
+    };
 
     ResponseRequest {
         model: model_id.into(),
@@ -207,11 +288,7 @@ pub fn into_open_ai_response(
         } else {
             Some(supports_parallel_tool_calls)
         },
-        tool_choice: tool_choice.map(|choice| match choice {
-            LanguageModelToolChoice::Auto => crate::ToolChoice::Auto,
-            LanguageModelToolChoice::Any => crate::ToolChoice::Required,
-            LanguageModelToolChoice::None => crate::ToolChoice::None,
-        }),
+        tool_choice,
         tools,
         prompt_cache_key: if supports_prompt_cache_key {
             thread_id
@@ -862,6 +939,22 @@ pub fn count_open_ai_tokens(request: LanguageModelRequest, model: Model) -> Resu
         | Model::FivePointFourPro => tiktoken_rs::num_tokens_from_messages("gpt-5", &messages),
     }
     .map(|tokens| tokens as u64)
+}
+
+pub fn deny_tool_use_events(
+    events: impl Stream<
+        Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+    >,
+) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+    events.map(|event| match event {
+        Ok(LanguageModelCompletionEvent::ToolUse(tool_use)) => {
+            Ok(LanguageModelCompletionEvent::Text(format!(
+                "\n\n[Error: Tool calls are disabled in this context. Attempted to call '{}']",
+                tool_use.name
+            )))
+        }
+        other => other,
+    })
 }
 
 #[cfg(test)]

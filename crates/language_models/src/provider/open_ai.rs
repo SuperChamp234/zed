@@ -26,7 +26,7 @@ use util::ResultExt;
 
 pub use open_ai::completion::{
     OpenAiEventMapper, OpenAiResponseEventMapper, collect_tiktoken_messages, count_open_ai_tokens,
-    into_open_ai, into_open_ai_response,
+    deny_tool_use_events, into_open_ai, into_open_ai_response,
 };
 
 const PROVIDER_ID: LanguageModelProviderId = OPEN_AI_PROVIDER_ID;
@@ -394,6 +394,8 @@ impl LanguageModel for OpenAiLanguageModel {
         >,
     > {
         if self.model.supports_chat_completions() {
+            let deny_tool_calls =
+                request.tool_choice == Some(LanguageModelToolChoice::None);
             let request = into_open_ai(
                 request,
                 self.model.id(),
@@ -405,10 +407,17 @@ impl LanguageModel for OpenAiLanguageModel {
             let completions = self.stream_completion(request, cx);
             async move {
                 let mapper = OpenAiEventMapper::new();
-                Ok(mapper.map_stream(completions.await?).boxed())
+                let stream = mapper.map_stream(completions.await?).boxed();
+                if deny_tool_calls {
+                    Ok(deny_tool_use_events(stream).boxed())
+                } else {
+                    Ok(stream)
+                }
             }
             .boxed()
         } else {
+            let deny_tool_calls =
+                request.tool_choice == Some(LanguageModelToolChoice::None);
             let request = into_open_ai_response(
                 request,
                 self.model.id(),
@@ -420,7 +429,12 @@ impl LanguageModel for OpenAiLanguageModel {
             let completions = self.stream_response(request, cx);
             async move {
                 let mapper = OpenAiResponseEventMapper::new();
-                Ok(mapper.map_stream(completions.await?).boxed())
+                let stream = mapper.map_stream(completions.await?).boxed();
+                if deny_tool_calls {
+                    Ok(deny_tool_use_events(stream).boxed())
+                } else {
+                    Ok(stream)
+                }
             }
             .boxed()
         }
